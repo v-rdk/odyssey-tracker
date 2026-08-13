@@ -54,6 +54,12 @@ STATE_PATH = Path(os.environ.get("STATE_PATH", "state.json"))
 DEEP_SCAN = os.environ.get("DEEP_SCAN", "0") == "1"
 TAIL_PAGES = int(os.environ.get("TAIL_PAGES", "2"))
 
+# Cloudflare allows roughly one request per run from a datacentre IP before it
+# starts serving challenges. On a residential IP set MAX_REQUESTS high (99) to
+# get the full detailed scrape.
+MAX_REQUESTS = int(os.environ.get("MAX_REQUESTS", "1"))
+_requests_used = 0
+
 # Pace between navigations. Too fast and Cloudflare serves a challenge.
 PAUSE_SECONDS = float(os.environ.get("PAUSE_SECONDS", "6"))
 
@@ -130,6 +136,10 @@ class Challenged(Exception):
     """Cloudflare served a bot challenge instead of the page."""
 
 
+class BudgetSpent(Exception):
+    """Request budget for this run is used up. Not an error."""
+
+
 # ----------------------------------------------------------------------------
 # Page helpers
 # ----------------------------------------------------------------------------
@@ -140,6 +150,11 @@ def article_url(permalink: str) -> str:
 
 def load(page, url: str, need_rows: bool = True, attempts: int = 3) -> str:
     """Navigate and return visible text, retrying through challenges."""
+    global _requests_used
+    if _requests_used >= MAX_REQUESTS:
+        raise BudgetSpent(f"request budget of {MAX_REQUESTS} reached")
+    _requests_used += 1
+
     last_err: Exception | None = None
 
     for attempt in range(attempts):
@@ -245,6 +260,9 @@ def scrape_listing(page, label: str, permalink: str) -> dict:
         time.sleep(PAUSE_SECONDS)
         try:
             text = load(page, hrefs[n])
+        except BudgetSpent:
+            print(f"  stopping at page {n}: request budget reached")
+            break
         except Exception as exc:
             print(f"  page {n} failed: {exc}", file=sys.stderr)
             visited.add(n)
@@ -341,6 +359,11 @@ def main() -> int:
             try:
                 result = scrape_listing(page, label, permalink)
                 ok_count += 1
+            except BudgetSpent:
+                print("  skipped: request budget reached")
+                if label in state:
+                    new_state[label] = state[label]
+                continue
             except Exception as exc:
                 print(f"  scrape failed: {exc}", file=sys.stderr)
                 if label in state:
@@ -376,9 +399,11 @@ def main() -> int:
                               f"availability:\n{lines}")
 
             if prev_last_page and result["last_page"] > prev_last_page:
-                alerts.append(f"<b>LISTING GREW: {label}</b>\n"
-                              f"Pages went from {prev_last_page} to "
-                              f"{result['last_page']}.")
+                alerts.append(f"<b>NEW SCREENINGS ADDED: {label}</b>\n"
+                              f"The listing grew from {prev_last_page} to "
+                              f"{result['last_page']} pages, so dates have been "
+                              f"added at the end. Open the listing and jump to "
+                              f"the last page.")
 
             new_state[label] = result
             time.sleep(PAUSE_SECONDS)
@@ -392,6 +417,9 @@ def main() -> int:
                 alerts.append("<b>BOOKING INFO PAGE CHANGED</b>\n"
                               "BFI edited the Odyssey booking-information "
                               "article. On-sale dates are posted there first.")
+        except BudgetSpent:
+            print("info article: skipped, request budget reached")
+            new_state["info_hash"] = state.get("info_hash")
         except Exception as exc:
             print(f"info article check failed: {exc}", file=sys.stderr)
             new_state["info_hash"] = state.get("info_hash")
