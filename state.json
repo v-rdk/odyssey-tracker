@@ -1,0 +1,38 @@
+{
+  "Odyssey 70mm": {
+    "label": "Odyssey 70mm",
+    "last_page": 20,
+    "pages_read": [
+      1
+    ],
+    "screenings": {
+      "2026-08-13 20:15": {
+        "date": "2026-08-13",
+        "sold_out": true,
+        "time": "20:15"
+      },
+      "2026-08-14 10:30": {
+        "date": "2026-08-14",
+        "sold_out": true,
+        "time": "10:30"
+      },
+      "2026-08-14 14:30": {
+        "date": "2026-08-14",
+        "sold_out": true,
+        "time": "14:30"
+      },
+      "2026-08-14 18:30": {
+        "date": "2026-08-14",
+        "sold_out": true,
+        "time": "18:30"
+      },
+      "2026-08-14 22:30": {
+        "date": "2026-08-14",
+        "sold_out": true,
+        "time": "22:30"
+      }
+    }
+  },
+  "checked_at": "2026-08-13T15:47:02+00:00",
+  "info_hash": null
+}
