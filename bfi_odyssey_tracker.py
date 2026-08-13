@@ -52,10 +52,10 @@ CUTOFF_DATE = date(2026, 9, 10)
 
 STATE_PATH = Path(os.environ.get("STATE_PATH", "state.json"))
 DEEP_SCAN = os.environ.get("DEEP_SCAN", "0") == "1"
-TAIL_PAGES = int(os.environ.get("TAIL_PAGES", "3"))
+TAIL_PAGES = int(os.environ.get("TAIL_PAGES", "2"))
 
 # Pace between navigations. Too fast and Cloudflare serves a challenge.
-PAUSE_SECONDS = 3.0
+PAUSE_SECONDS = float(os.environ.get("PAUSE_SECONDS", "6"))
 
 MONTHS = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
@@ -94,6 +94,36 @@ CHALLENGE_JS = """() => {
     if (document.querySelector('#challenge-form, .cf-challenge')) return true;
     return (document.body.innerText || '').trim().length < 400;
 }"""
+
+
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-GB', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = window.chrome || {runtime: {}};
+"""
+
+LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+]
+
+
+def launch_browser(p):
+    """
+    Prefer real Chrome in headed mode under a virtual display: Playwright's
+    bundled headless Chromium is easy to fingerprint and Cloudflare blocks it.
+    Falls back to plain Chromium so the script still runs locally.
+    """
+    headed = os.environ.get("DISPLAY") is not None
+    try:
+        b = p.chromium.launch(channel="chrome", headless=not headed, args=LAUNCH_ARGS)
+        print(f"browser: chrome (headless={not headed})")
+        return b
+    except Exception as exc:
+        print(f"chrome unavailable ({exc}); falling back to chromium", file=sys.stderr)
+        return p.chromium.launch(headless=True, args=LAUNCH_ARGS)
 
 
 class Challenged(Exception):
@@ -197,30 +227,45 @@ def scrape_listing(page, label: str, permalink: str) -> dict:
     last_page, hrefs = read_pagination(page)
     print(f"  page 1: {len(first)} rows, {last_page} page(s) total")
 
+    # Page 1 only links to 2, 3, 4 and the last page; the middle is behind
+    # a "...". So visit the last page first, then read its pagination to reach
+    # the pages just before it.
     if DEEP_SCAN:
-        wanted = sorted(n for n in hrefs if n >= 2)
+        queue = sorted(n for n in hrefs if n >= 2)
     else:
-        wanted = sorted(n for n in hrefs if n > max(1, last_page - TAIL_PAGES))
+        queue = [last_page] if last_page > 1 else []
 
     pages_read = [1]
-    for n in wanted:
+    visited = {1}
+
+    while queue:
+        n = queue.pop(0)
+        if n in visited:
+            continue
         time.sleep(PAUSE_SECONDS)
         try:
             text = load(page, hrefs[n])
         except Exception as exc:
             print(f"  page {n} failed: {exc}", file=sys.stderr)
+            visited.add(n)
             continue
 
         rows = parse_screenings(text)
         print(f"  page {n}: {len(rows)} rows")
         merge(all_rows, rows)
+        visited.add(n)
         pages_read.append(n)
 
-        # Later pages expose links to pages that were hidden behind the "..."
+        newer_last, more = read_pagination(page)
+        last_page = max(last_page, newer_last)
+        hrefs.update({k: v for k, v in more.items() if k not in hrefs})
+
+        # Queue up the pages immediately before the last one.
         if not DEEP_SCAN:
-            newer_last, more = read_pagination(page)
-            last_page = max(last_page, newer_last)
-            hrefs.update({k: v for k, v in more.items() if k not in hrefs})
+            for back in range(1, TAIL_PAGES):
+                target = last_page - back
+                if target > 1 and target in hrefs and target not in visited:
+                    queue.append(target)
 
     return {
         "label": label,
@@ -282,13 +327,13 @@ def main() -> int:
     }
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = launch_browser(p)
         ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
             locale="en-GB",
             timezone_id="Europe/London",
+            viewport={"width": 1440, "height": 900},
         )
+        ctx.add_init_script(STEALTH_JS)
         page = ctx.new_page()
 
         for label, permalink in LISTINGS.items():
