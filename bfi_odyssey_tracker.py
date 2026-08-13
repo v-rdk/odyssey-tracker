@@ -3,28 +3,25 @@
 BFI IMAX - The Odyssey (70mm) screening tracker.
 
 Watches the BFI IMAX listing for The Odyssey and sends a Telegram alert when:
-  1. any screening appears on a date after CUTOFF_DATE (i.e. the run is extended)
-  2. any screening that was previously "Sold out" becomes bookable (returns)
-  3. the booking-information article text changes (this is where BFI posts
-     on-sale dates and times for new batches)
+  1. any screening appears on a date after CUTOFF_DATE (the run is extended)
+  2. any screening shows as bookable rather than sold out (new batch or returns)
+  3. the booking-information article changes (BFI posts on-sale times there)
 
-The screening list is rendered by the site's Tessitura widget, so a plain
-HTTP request will not see it. Playwright is required.
+The screening list is injected by the site's Tessitura widget, so a plain HTTP
+request will not see it. Playwright is required.
 
 Env vars:
   TELEGRAM_BOT_TOKEN   required
   TELEGRAM_CHAT_ID     required
   STATE_PATH           optional, defaults to ./state.json
-  WATCH_RETURNS        optional, "1" to walk every page looking for returns
-                       (slower, ~16+ page loads). Default "0" = last page only.
 """
 
+import hashlib
 import json
 import os
 import re
 import sys
-import hashlib
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import requests
@@ -34,25 +31,25 @@ BASE = "https://whatson.bfi.org.uk/imax/Online/default.asp"
 PERMALINK_PARAM = "BOparam::WScontent::loadArticle::permalink"
 PAGE_PARAM = "BOset::WScontent::SearchResultsInfo::current_page"
 
-# Listings to watch. The SDH screenings are a separate listing on the BFI site.
 LISTINGS = {
     "Odyssey 70mm": "odyssey-the-film-imax-70mm-2026",
     "Odyssey 70mm (SDH)": "odyssey-the-film-imax-70mm-2026-sdh",
 }
 
-# Article page where BFI posts on-sale dates for new batches.
 INFO_ARTICLE = "odyssey-booking-information"
 
-# Anything strictly after this date is a new screening you care about.
+# Anything strictly after this date is a new screening worth shouting about.
 CUTOFF_DATE = date(2026, 9, 10)
 
+# Hard stop so a pagination quirk can never loop forever.
+MAX_PAGES = 60
+
 STATE_PATH = Path(os.environ.get("STATE_PATH", "state.json"))
-WATCH_RETURNS = os.environ.get("WATCH_RETURNS", "0") == "1"
 
 MONTHS = {
-    "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
-    "July": 7, "August": 8, "September": 9, "October": 10, "November": 11,
-    "December": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
 }
 
 ROW_RE = re.compile(
@@ -67,6 +64,9 @@ ROW_RE = re.compile(
 
 SOLD_OUT_RE = re.compile(r"sold\s*out", re.IGNORECASE)
 
+# Fires once a row like "... 2026 13:30" is present in the DOM.
+ROWS_PRESENT_JS = r"() => /\d{4}\s+\d{1,2}:\d{2}/.test(document.body.innerText)"
+
 
 # ----------------------------------------------------------------------------
 # Page helpers
@@ -79,83 +79,107 @@ def listing_url(permalink: str, page_no: int | None = None) -> str:
     return url
 
 
-def open_listing(page, permalink: str, page_no: int | None = None) -> str:
-    """Load a listing page and return the visible text of the main content."""
-    page.goto(listing_url(permalink, page_no), wait_until="networkidle", timeout=60_000)
-    # Give the booking widget a beat to inject the performance rows.
-    try:
-        page.wait_for_function(
-            "() => /\\d{1,2}:\\d{2}/.test(document.body.innerText)",
-            timeout=20_000,
-        )
-    except PWTimeout:
-        pass
-    return page.inner_text("body")
+def load_page(page, permalink: str, page_no: int | None = None,
+              need_rows: bool = True, attempts: int = 2) -> str:
+    """
+    Load a page and return its visible text.
+
+    Waits on domcontentloaded rather than networkidle: this site keeps
+    background requests running indefinitely, so networkidle never fires.
+    """
+    url = listing_url(permalink, page_no)
+    last_err: Exception | None = None
+
+    for _ in range(attempts):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        except PWTimeout as exc:
+            last_err = exc
+            continue
+
+        if need_rows:
+            try:
+                page.wait_for_function(ROWS_PRESENT_JS, timeout=25_000)
+            except PWTimeout:
+                # No rows may be legitimate, e.g. a page past the end.
+                pass
+        else:
+            page.wait_for_timeout(2_000)
+
+        return page.inner_text("body")
+
+    raise last_err if last_err else RuntimeError(f"could not load {url}")
 
 
-def find_last_page(text: str) -> int:
-    """Read the pagination strip and return the highest page number shown."""
-    # Pagination renders as a run of bare numbers near the end of the listing.
-    tail = text[-2000:]
-    nums = [int(n) for n in re.findall(r"(?<!\d)(\d{1,3})(?!\d)", tail)]
-    nums = [n for n in nums if 1 <= n <= 200]
-    return max(nums) if nums else 1
-
-
-def parse_screenings(text: str) -> list[dict]:
+def parse_screenings(text: str) -> dict[str, dict]:
     """Pull every screening row out of the page text with its sold-out status."""
     matches = list(ROW_RE.finditer(text))
-    rows = []
+    rows: dict[str, dict] = {}
+
     for i, m in enumerate(matches):
         end = matches[i + 1].start() if i + 1 < len(matches) else min(len(text), m.end() + 200)
         segment = text[m.end():end]
         try:
-            d = date(int(m.group("year")), MONTHS[m.group("month").capitalize()], int(m.group("day")))
+            d = date(
+                int(m.group("year")),
+                MONTHS[m.group("month").lower()],
+                int(m.group("day")),
+            )
         except (KeyError, ValueError):
             continue
-        rows.append({
-            "date": d.isoformat(),
-            "time": m.group("time"),
-            "sold_out": bool(SOLD_OUT_RE.search(segment)),
-        })
+
+        key = f"{d.isoformat()} {m.group('time')}"
+        entry = {"date": d.isoformat(), "time": m.group("time"),
+                 "sold_out": bool(SOLD_OUT_RE.search(segment))}
+        # If the same slot shows twice, keep the more available reading.
+        if key not in rows or (rows[key]["sold_out"] and not entry["sold_out"]):
+            rows[key] = entry
+
     return rows
 
 
 def scrape_listing(page, label: str, permalink: str) -> dict:
-    """Scrape one listing. Returns page count and the screenings found."""
-    first_text = open_listing(page, permalink)
-    last_page = find_last_page(first_text)
+    """
+    Walk pages 1, 2, 3 ... until a page is empty or repeats the previous one.
 
-    screenings = parse_screenings(first_text)
+    No pagination parsing: out-of-range pages on this site tend to clamp back
+    to the last real page, so a repeat is the reliable end-of-list signal.
+    """
+    all_rows: dict[str, dict] = {}
+    seen: set[str] = set()
 
-    pages_to_read = range(2, last_page + 1) if WATCH_RETURNS else (
-        [last_page] if last_page > 1 else []
-    )
-    for n in pages_to_read:
-        txt = open_listing(page, permalink, n)
-        screenings.extend(parse_screenings(txt))
+    first = parse_screenings(load_page(page, permalink))
+    if not first:
+        raise RuntimeError("no screening rows found on the first page")
 
-    # Dedupe on date + time, keeping the most available status seen.
-    merged: dict[str, dict] = {}
-    for s in screenings:
-        key = f"{s['date']} {s['time']}"
-        if key not in merged or (merged[key]["sold_out"] and not s["sold_out"]):
-            merged[key] = s
+    all_rows.update(first)
+    seen.add(json.dumps(sorted(first), sort_keys=True))
+    pages_read = 1
+
+    for n in range(2, MAX_PAGES + 1):
+        rows = parse_screenings(load_page(page, permalink, n))
+        if not rows:
+            break
+        sig = json.dumps(sorted(rows), sort_keys=True)
+        if sig in seen:
+            break
+        seen.add(sig)
+        for k, v in rows.items():
+            if k not in all_rows or (all_rows[k]["sold_out"] and not v["sold_out"]):
+                all_rows[k] = v
+        pages_read = n
 
     return {
         "label": label,
-        "last_page": last_page,
-        "screenings": dict(sorted(merged.items())),
+        "pages": pages_read,
+        "screenings": dict(sorted(all_rows.items())),
     }
 
 
 def scrape_info_article(page) -> str:
     """Hash the booking-info article body so we can detect edits."""
-    page.goto(listing_url(INFO_ARTICLE), wait_until="networkidle", timeout=60_000)
-    body = page.inner_text("body")
-    # Strip the volatile basket / promo furniture before hashing.
-    core = re.sub(r"\s+", " ", body)
-    core = core.split("Add a promo code")[0]
+    body = load_page(page, INFO_ARTICLE, need_rows=False)
+    core = re.sub(r"\s+", " ", body).split("Add a promo code")[0]
     return hashlib.sha256(core.encode("utf-8")).hexdigest()[:16]
 
 
@@ -177,15 +201,12 @@ def save_state(state: dict) -> None:
 
 
 def send_telegram(message: str) -> None:
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
     resp = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
+        f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
         json={
-            "chat_id": chat_id,
+            "chat_id": os.environ["TELEGRAM_CHAT_ID"],
             "text": message,
             "parse_mode": "HTML",
-            "disable_web_page_preview": False,
         },
         timeout=30,
     )
@@ -205,7 +226,10 @@ def pretty(key: str) -> str:
 def main() -> int:
     state = load_state()
     alerts: list[str] = []
-    new_state: dict = {"checked_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+    failures: list[str] = []
+    new_state: dict = {
+        "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds")
+    }
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -224,13 +248,19 @@ def main() -> int:
                 result = scrape_listing(page, label, permalink)
             except Exception as exc:
                 print(f"[{label}] scrape failed: {exc}", file=sys.stderr)
+                failures.append(label)
+                # Carry the old state forward so we do not re-alert next run.
+                if label in state:
+                    new_state[label] = state[label]
                 continue
+
+            print(f"[{label}] {len(result['screenings'])} screenings "
+                  f"across {result['pages']} page(s)")
 
             prev = state.get(label, {})
             prev_screenings = prev.get("screenings", {})
-            prev_last_page = prev.get("last_page", 0)
+            prev_pages = prev.get("pages", 0)
 
-            # 1. Screenings past the cutoff that we have not alerted on yet.
             extended = [
                 k for k, v in result["screenings"].items()
                 if date.fromisoformat(v["date"]) > CUTOFF_DATE and k not in prev_screenings
@@ -242,12 +272,10 @@ def main() -> int:
                     f"{len(extended)} screening(s) past {CUTOFF_DATE:%d %b}:\n{lines}"
                 )
 
-            # 2. Anything bookable right now (returns or a fresh batch on sale).
             bookable = [
                 k for k, v in result["screenings"].items()
-                if not v["sold_out"] and (
-                    k not in prev_screenings or prev_screenings[k].get("sold_out", True)
-                )
+                if not v["sold_out"]
+                and (k not in prev_screenings or prev_screenings[k].get("sold_out", True))
             ]
             if bookable:
                 lines = "\n".join(f"  - {pretty(k)}" for k in sorted(bookable)[:25])
@@ -256,27 +284,27 @@ def main() -> int:
                     f"{len(bookable)} screening(s) showing availability:\n{lines}"
                 )
 
-            # 3. Pagination grew, which means rows were added somewhere.
-            if prev_last_page and result["last_page"] > prev_last_page:
+            if prev_pages and result["pages"] > prev_pages:
                 alerts.append(
                     f"<b>LISTING GREW: {label}</b>\n"
-                    f"Pages went from {prev_last_page} to {result['last_page']}."
+                    f"Pages went from {prev_pages} to {result['pages']}."
                 )
 
             new_state[label] = result
 
-        # 4. Booking-information article edited (this is where on-sale times land).
         try:
             info_hash = scrape_info_article(page)
             new_state["info_hash"] = info_hash
+            print(f"info article hash: {info_hash}")
             if state.get("info_hash") and state["info_hash"] != info_hash:
                 alerts.append(
                     "<b>BOOKING INFO PAGE CHANGED</b>\n"
                     "BFI edited the Odyssey booking-information article. "
-                    "New on-sale dates are usually posted here first."
+                    "New on-sale dates are usually posted there first."
                 )
         except Exception as exc:
             print(f"info article check failed: {exc}", file=sys.stderr)
+            failures.append("info article")
             new_state["info_hash"] = state.get("info_hash")
 
         browser.close()
@@ -290,6 +318,12 @@ def main() -> int:
         print("No change.")
 
     save_state(new_state)
+
+    # Fail loudly if nothing could be scraped, so a silently broken tracker
+    # shows up as a red run instead of a permanent "No change".
+    if len(failures) >= len(LISTINGS) + 1:
+        print("Every check failed. Treating this run as broken.", file=sys.stderr)
+        return 1
     return 0
 
 
