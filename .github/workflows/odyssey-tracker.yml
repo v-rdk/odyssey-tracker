@@ -41,6 +41,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_PATH: state.json
           PAUSE_SECONDS: "8"
+          MAX_REQUESTS: "1"
           TAIL_PAGES: "2"
         # xvfb-run gives Chrome a virtual display so it can run headed.
         run: xvfb-run -a python bfi_odyssey_tracker.py
