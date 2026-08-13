@@ -39,7 +39,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_PATH: state.json
           WATCH_RETURNS: "0"
-        run: python bfi_odyssey_tracker.py
+        run: python dump_dom.py
 
       - name: Persist state
         run: |
